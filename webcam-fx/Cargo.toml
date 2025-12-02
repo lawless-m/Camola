@@ -1,0 +1,25 @@
+[package]
+name = "webcam-fx"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Camera capture
+nokhwa = { version = "0.10", features = ["input-v4l"] }
+
+# v4l2 output
+v4l = "0.14"
+
+# Image handling
+image = "0.25"
+
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# CLI
+clap = { version = "4.0", features = ["derive"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = "0.3"
