@@ -11,6 +11,7 @@ import cv2
 import onnxruntime as ort
 from PIL import Image
 import fcntl
+from collections import deque
 
 class CamolaGPU:
     def __init__(self, model_path, input_device=0, output_device="/dev/video10",
@@ -19,7 +20,11 @@ class CamolaGPU:
                  background_color=None, background_image=None, background_video=None,
                  pixelate_background=False, pixel_size=16,
                  invert_background=False,
-                 foreground_effect=None, fps=30):
+                 foreground_effect=None,
+                 trails_enabled=False, trails_interval=5, trails_count=6,
+                 trails_fade_start=0.1, trails_fade_end=0.5,
+                 trails_pixelate=False, trails_hue_shift=0,
+                 fps=30):
 
         self.output_width = output_width
         self.output_height = output_height
@@ -32,9 +37,20 @@ class CamolaGPU:
         self.invert_background = invert_background
         self.foreground_effect = foreground_effect
 
+        # Trails effect settings
+        self.trails_enabled = trails_enabled
+        self.trails_interval = trails_interval
+        self.trails_count = trails_count
+        self.trails_fade_start = trails_fade_start
+        self.trails_fade_end = trails_fade_end
+        self.trails_pixelate = trails_pixelate
+        self.trails_hue_shift = trails_hue_shift
+        self.trails_buffer = deque(maxlen=trails_count)
+        self.frame_counter = 0
+
         # Temporal smoothing for matte stability
         self.prev_matte = None
-        self.temporal_alpha = 0.7  # Blend factor: higher = more weight on current frame
+        self.temporal_alpha = 0.3  # Blend factor: higher = more weight on current frame
 
         # Initialize webcam capture
         print(f"Initializing webcam {input_device} at {capture_width}x{capture_height}", flush=True)
@@ -199,7 +215,7 @@ class CamolaGPU:
         else:
             foreground = frame_resized
 
-        # Pixelate background effect
+        # Determine background layer
         if self.pixelate_background:
             # Create pixelated version of the frame
             h, w = frame_resized.shape[:2]
@@ -213,21 +229,70 @@ class CamolaGPU:
             if self.invert_background:
                 pixelated = 255 - pixelated
 
-            # Composite: effected foreground + pixelated background
-            composited = (foreground * matte_3ch + pixelated * (1 - matte_3ch)).astype(np.uint8)
-            return composited
+            background = pixelated
+        else:
+            # Get background (static or video frame)
+            background = self.get_background_frame()
 
-        # Get background (static or video frame)
-        background = self.get_background_frame()
-
-        # Background replacement
+        # Default background if none specified
         if background is None:
-            # No background replacement, just return with foreground effect applied
-            composited = (foreground * matte_3ch + frame_resized * (1 - matte_3ch)).astype(np.uint8)
-            return composited
+            background = frame_resized
 
-        # Composite: effected foreground + background
-        composited = (foreground * matte_3ch + background * (1 - matte_3ch)).astype(np.uint8)
+        # Trails effect
+        if self.trails_enabled:
+            # Capture trail snapshot at intervals
+            if self.frame_counter % self.trails_interval == 0:
+                # Capture foreground with effects
+                trail_foreground = foreground.copy()
+
+                # Apply pixelation to trail if enabled
+                if self.trails_pixelate:
+                    h, w = trail_foreground.shape[:2]
+                    small = cv2.resize(trail_foreground, (w // self.pixel_size, h // self.pixel_size),
+                                     interpolation=cv2.INTER_LINEAR)
+                    trail_foreground = cv2.resize(small, (w, h), interpolation=cv2.INTER_NEAREST)
+
+                # Store foreground with alpha (RGBA premultiplied)
+                trail_frame = (trail_foreground * matte_3ch).astype(np.uint8)
+                trail_matte = matte_resized.copy()
+                self.trails_buffer.append((trail_frame, trail_matte))
+
+            # Composite trails onto background
+            if len(self.trails_buffer) > 0:
+                # Start with background
+                result = background.copy()
+
+                # Layer trails from oldest to newest with increasing opacity
+                num_trails = len(self.trails_buffer)
+                for i, (trail_frame, trail_matte) in enumerate(self.trails_buffer):
+                    # Calculate opacity using exponential decay
+                    # Oldest trail = fade_start, newest trail = fade_end
+                    t = i / max(num_trails - 1, 1)  # 0.0 to 1.0
+                    opacity = self.trails_fade_start + t * (self.trails_fade_end - self.trails_fade_start)
+
+                    # Apply hue shift if enabled
+                    trail_display = trail_frame.copy()
+                    if self.trails_hue_shift != 0:
+                        # Convert to HSV, shift hue, convert back
+                        hsv = cv2.cvtColor(trail_display, cv2.COLOR_BGR2HSV).astype(np.float32)
+                        hue_shift = self.trails_hue_shift * i  # Progressive shift
+                        hsv[:, :, 0] = (hsv[:, :, 0] + hue_shift) % 180
+                        trail_display = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
+
+                    # Expand matte to 3 channels and apply opacity
+                    trail_matte_3ch = np.stack([trail_matte] * 3, axis=-1) * opacity
+
+                    # Composite this trail onto result
+                    result = (trail_display * trail_matte_3ch + result * (1 - trail_matte_3ch)).astype(np.uint8)
+
+                # Composite current frame on top at full opacity (sharp, not pixelated)
+                composited = (foreground * matte_3ch + result * (1 - matte_3ch)).astype(np.uint8)
+            else:
+                # No trails in buffer yet, just composite foreground + background
+                composited = (foreground * matte_3ch + background * (1 - matte_3ch)).astype(np.uint8)
+        else:
+            # No trails, just composite foreground + background
+            composited = (foreground * matte_3ch + background * (1 - matte_3ch)).astype(np.uint8)
 
         return composited
 
@@ -288,6 +353,7 @@ class CamolaGPU:
                 total_output_time += output_time
 
                 frame_count += 1
+                self.frame_counter += 1
 
                 # Log stats every 30 frames
                 if frame_count % 30 == 0:
@@ -333,6 +399,13 @@ def main():
     parser.add_argument("--pixel-size", type=int, default=16, help="Pixel block size for pixelation effect (default: 16)")
     parser.add_argument("--invert-background", action="store_true", help="Invert colors in background")
     parser.add_argument("--foreground-effect", choices=['cartoon', 'sketch', 'sketch_bw'], help="Apply artistic effect to foreground (you)")
+    parser.add_argument("--trails", action="store_true", help="Enable ghosting/trails effect")
+    parser.add_argument("--trails-interval", type=int, default=5, help="Frames between trail snapshots (default: 5)")
+    parser.add_argument("--trails-count", type=int, default=6, help="Number of trail frames to keep (default: 6)")
+    parser.add_argument("--trails-fade-start", type=float, default=0.1, help="Opacity of oldest trail (default: 0.1)")
+    parser.add_argument("--trails-fade-end", type=float, default=0.5, help="Opacity of newest trail (default: 0.5)")
+    parser.add_argument("--trails-pixelate", action="store_true", help="Apply pixelation effect to trails")
+    parser.add_argument("--trails-hue-shift", type=int, default=0, help="Hue shift per trail in degrees (0-180, default: 0)")
 
     args = parser.parse_args()
 
@@ -351,6 +424,13 @@ def main():
         pixel_size=args.pixel_size,
         invert_background=args.invert_background,
         foreground_effect=args.foreground_effect,
+        trails_enabled=args.trails,
+        trails_interval=args.trails_interval,
+        trails_count=args.trails_count,
+        trails_fade_start=args.trails_fade_start,
+        trails_fade_end=args.trails_fade_end,
+        trails_pixelate=args.trails_pixelate,
+        trails_hue_shift=args.trails_hue_shift,
         fps=args.fps
     )
 
