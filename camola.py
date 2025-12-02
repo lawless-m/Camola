@@ -24,6 +24,8 @@ class CamolaGPU:
                  trails_enabled=False, trails_interval=5, trails_count=6,
                  trails_fade_start=0.1, trails_fade_end=0.5,
                  trails_pixelate=False, trails_hue_shift=0,
+                 plasma_enabled=False, plasma_speed=1.0, plasma_scale=0.02, plasma_palette="classic",
+                 foreground_opacity=1.0, foreground_saturation=1.0,
                  fps=30):
 
         self.output_width = output_width
@@ -47,6 +49,17 @@ class CamolaGPU:
         self.trails_hue_shift = trails_hue_shift
         self.trails_buffer = deque(maxlen=trails_count)
         self.frame_counter = 0
+
+        # Plasma effect settings
+        self.plasma_enabled = plasma_enabled
+        self.plasma_speed = plasma_speed
+        self.plasma_scale = plasma_scale
+        self.plasma_palette = plasma_palette
+        self.plasma_time = 0.0
+
+        # Foreground opacity and saturation
+        self.foreground_opacity = foreground_opacity
+        self.foreground_saturation = foreground_saturation
 
         # Temporal smoothing for matte stability
         self.prev_matte = None
@@ -197,6 +210,143 @@ class CamolaGPU:
         bg_frame = cv2.resize(bg_frame, (self.output_width, self.output_height))
         return bg_frame
 
+    def get_plasma_palette(self, value):
+        """Map value (0-1) to RGB color based on selected palette"""
+        # Clamp value to 0-1
+        value = np.clip(value, 0.0, 1.0)
+
+        if self.plasma_palette == "classic":
+            # Cyan → magenta → yellow → cyan (smooth rainbow)
+            r = int(127.5 + 127.5 * np.sin(value * 2 * np.pi))
+            g = int(127.5 + 127.5 * np.sin(value * 2 * np.pi + 2 * np.pi / 3))
+            b = int(127.5 + 127.5 * np.sin(value * 2 * np.pi + 4 * np.pi / 3))
+            return (b, g, r)  # OpenCV uses BGR
+
+        elif self.plasma_palette == "fire":
+            # Black → red → orange → yellow → white
+            if value < 0.25:
+                # Black to dark red
+                t = value / 0.25
+                return (0, 0, int(127 * t))
+            elif value < 0.5:
+                # Dark red to bright red
+                t = (value - 0.25) / 0.25
+                return (0, 0, int(127 + 128 * t))
+            elif value < 0.75:
+                # Red to orange/yellow
+                t = (value - 0.5) / 0.25
+                return (0, int(255 * t), 255)
+            else:
+                # Orange to white
+                t = (value - 0.75) / 0.25
+                return (int(255 * t), 255, 255)
+
+        elif self.plasma_palette == "ocean":
+            # Deep blue → cyan → turquoise → white
+            if value < 0.5:
+                t = value / 0.5
+                return (int(64 + 191 * t), int(64 * t), int(16 + 48 * t))
+            else:
+                t = (value - 0.5) / 0.5
+                return (int(255), int(64 + 191 * t), int(64 + 191 * t))
+
+        elif self.plasma_palette == "neon":
+            # Black → magenta → cyan → white
+            if value < 0.33:
+                t = value / 0.33
+                return (int(255 * t), 0, int(255 * t))
+            elif value < 0.67:
+                t = (value - 0.33) / 0.34
+                return (255, int(255 * t), int(255 - 255 * t))
+            else:
+                t = (value - 0.67) / 0.33
+                return (255, 255, int(255 * t))
+
+        elif self.plasma_palette == "monochrome":
+            # Single hue, varying brightness (cyan-ish)
+            intensity = int(255 * value)
+            return (intensity, int(intensity * 0.7), int(intensity * 0.3))
+
+        # Default to classic if unknown palette
+        r = int(127.5 + 127.5 * np.sin(value * 2 * np.pi))
+        g = int(127.5 + 127.5 * np.sin(value * 2 * np.pi + 2 * np.pi / 3))
+        b = int(127.5 + 127.5 * np.sin(value * 2 * np.pi + 4 * np.pi / 3))
+        return (b, g, r)
+
+    def generate_plasma(self):
+        """Generate a plasma effect frame"""
+        h, w = self.output_height, self.output_width
+
+        # Create coordinate grids normalized to 0-1
+        y, x = np.meshgrid(np.linspace(0, 1, h), np.linspace(0, 1, w), indexing='ij')
+
+        # Compute plasma using multiple sine wave layers
+        t = self.plasma_time
+        scale = self.plasma_scale
+
+        # Layer 1: horizontal wave
+        v1 = np.sin(x / scale + t)
+
+        # Layer 2: vertical wave
+        v2 = np.sin(y / scale + t * 0.7)
+
+        # Layer 3: diagonal wave
+        v3 = np.sin((x + y) / (scale * 2) + t * 1.3)
+
+        # Layer 4: radial wave from center
+        cx, cy = 0.5, 0.5
+        dist = np.sqrt((x - cx)**2 + (y - cy)**2)
+        v4 = np.sin(dist / scale + t)
+
+        # Combine layers (average)
+        plasma = (v1 + v2 + v3 + v4) / 4.0
+
+        # Map from -1..1 to 0..1
+        plasma = (plasma + 1.0) / 2.0
+
+        # Vectorized palette application
+        if self.plasma_palette == "classic":
+            # Cyan → magenta → yellow → cyan (smooth rainbow)
+            r = (127.5 + 127.5 * np.sin(plasma * 2 * np.pi)).astype(np.uint8)
+            g = (127.5 + 127.5 * np.sin(plasma * 2 * np.pi + 2 * np.pi / 3)).astype(np.uint8)
+            b = (127.5 + 127.5 * np.sin(plasma * 2 * np.pi + 4 * np.pi / 3)).astype(np.uint8)
+            frame = np.stack([b, g, r], axis=-1)  # OpenCV uses BGR
+
+        elif self.plasma_palette == "fire":
+            # Black → red → orange → yellow → white
+            r = np.clip(plasma * 4 * 255, 0, 255).astype(np.uint8)
+            g = np.clip((plasma - 0.5) * 4 * 255, 0, 255).astype(np.uint8)
+            b = np.clip((plasma - 0.75) * 4 * 255, 0, 255).astype(np.uint8)
+            frame = np.stack([b, g, r], axis=-1)
+
+        elif self.plasma_palette == "ocean":
+            # Deep blue → cyan → turquoise → white
+            r = np.clip((plasma - 0.5) * 2 * 191 + 64, 16, 255).astype(np.uint8)
+            g = np.clip((plasma - 0.5) * 2 * 191 + 64, 0, 255).astype(np.uint8)
+            b = np.clip(plasma * 191 + 64, 64, 255).astype(np.uint8)
+            frame = np.stack([b, g, r], axis=-1)
+
+        elif self.plasma_palette == "neon":
+            # Black → magenta → cyan → white
+            r = np.clip(plasma * 255, 0, 255).astype(np.uint8)
+            g = np.clip((plasma - 0.33) * 3 * 255, 0, 255).astype(np.uint8)
+            b = np.clip((1 - plasma) * 3 * 255, 0, 255).astype(np.uint8)
+            frame = np.stack([np.maximum(b, r), g, r], axis=-1)
+
+        elif self.plasma_palette == "monochrome":
+            # Single hue, varying brightness (cyan-ish)
+            intensity = (plasma * 255).astype(np.uint8)
+            frame = np.stack([intensity, (intensity * 0.7).astype(np.uint8), (intensity * 0.3).astype(np.uint8)], axis=-1)
+
+        else:
+            # Default to classic
+            r = (127.5 + 127.5 * np.sin(plasma * 2 * np.pi)).astype(np.uint8)
+            g = (127.5 + 127.5 * np.sin(plasma * 2 * np.pi + 2 * np.pi / 3)).astype(np.uint8)
+            b = (127.5 + 127.5 * np.sin(plasma * 2 * np.pi + 4 * np.pi / 3)).astype(np.uint8)
+            frame = np.stack([b, g, r], axis=-1)
+
+        return frame
+
     def composite(self, frame, matte):
         """Composite foreground onto background using matte"""
         # Resize frame to output size
@@ -215,8 +365,17 @@ class CamolaGPU:
         else:
             foreground = frame_resized
 
+        # Apply saturation boost to foreground if enabled
+        if self.foreground_saturation != 1.0:
+            hsv = cv2.cvtColor(foreground, cv2.COLOR_BGR2HSV).astype(np.float32)
+            hsv[:, :, 1] = np.clip(hsv[:, :, 1] * self.foreground_saturation, 0, 255)
+            foreground = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
+
         # Determine background layer
-        if self.pixelate_background:
+        if self.plasma_enabled:
+            # Generate plasma effect background
+            background = self.generate_plasma()
+        elif self.pixelate_background:
             # Create pixelated version of the frame
             h, w = frame_resized.shape[:2]
             # Downscale to pixelate
@@ -285,14 +444,17 @@ class CamolaGPU:
                     # Composite this trail onto result
                     result = (trail_display * trail_matte_3ch + result * (1 - trail_matte_3ch)).astype(np.uint8)
 
-                # Composite current frame on top at full opacity (sharp, not pixelated)
-                composited = (foreground * matte_3ch + result * (1 - matte_3ch)).astype(np.uint8)
+                # Composite current frame on top with global opacity (sharp, not pixelated)
+                final_matte = matte_3ch * self.foreground_opacity
+                composited = (foreground * final_matte + result * (1 - final_matte)).astype(np.uint8)
             else:
                 # No trails in buffer yet, just composite foreground + background
-                composited = (foreground * matte_3ch + background * (1 - matte_3ch)).astype(np.uint8)
+                final_matte = matte_3ch * self.foreground_opacity
+                composited = (foreground * final_matte + background * (1 - final_matte)).astype(np.uint8)
         else:
             # No trails, just composite foreground + background
-            composited = (foreground * matte_3ch + background * (1 - matte_3ch)).astype(np.uint8)
+            final_matte = matte_3ch * self.foreground_opacity
+            composited = (foreground * final_matte + background * (1 - final_matte)).astype(np.uint8)
 
         return composited
 
@@ -355,6 +517,10 @@ class CamolaGPU:
                 frame_count += 1
                 self.frame_counter += 1
 
+                # Update plasma time for animation
+                if self.plasma_enabled:
+                    self.plasma_time += self.plasma_speed * self.frame_duration
+
                 # Log stats every 30 frames
                 if frame_count % 30 == 0:
                     avg_capture_ms = (total_capture_time / frame_count) * 1000
@@ -406,6 +572,12 @@ def main():
     parser.add_argument("--trails-fade-end", type=float, default=0.5, help="Opacity of newest trail (default: 0.5)")
     parser.add_argument("--trails-pixelate", action="store_true", help="Apply pixelation effect to trails")
     parser.add_argument("--trails-hue-shift", type=int, default=0, help="Hue shift per trail in degrees (0-180, default: 0)")
+    parser.add_argument("--plasma", action="store_true", help="Enable plasma effect background")
+    parser.add_argument("--plasma-speed", type=float, default=1.0, help="Plasma animation speed (default: 1.0)")
+    parser.add_argument("--plasma-scale", type=float, default=0.02, help="Plasma pattern scale (default: 0.02)")
+    parser.add_argument("--plasma-palette", choices=['classic', 'fire', 'ocean', 'neon', 'monochrome'], default='classic', help="Plasma color palette (default: classic)")
+    parser.add_argument("--foreground-opacity", type=float, default=1.0, help="Foreground (you) opacity, 0.0-1.0 (default: 1.0, fully opaque)")
+    parser.add_argument("--foreground-saturation", type=float, default=1.0, help="Foreground (you) color saturation multiplier (default: 1.0)")
 
     args = parser.parse_args()
 
@@ -431,6 +603,12 @@ def main():
         trails_fade_end=args.trails_fade_end,
         trails_pixelate=args.trails_pixelate,
         trails_hue_shift=args.trails_hue_shift,
+        plasma_enabled=args.plasma,
+        plasma_speed=args.plasma_speed,
+        plasma_scale=args.plasma_scale,
+        plasma_palette=args.plasma_palette,
+        foreground_opacity=args.foreground_opacity,
+        foreground_saturation=args.foreground_saturation,
         fps=args.fps
     )
 
