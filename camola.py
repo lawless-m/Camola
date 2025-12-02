@@ -16,7 +16,7 @@ class CamolaGPU:
     def __init__(self, model_path, input_device=0, output_device="/dev/video10",
                  capture_width=1920, capture_height=1080,
                  output_width=1280, output_height=720,
-                 background_color=None, background_image=None,
+                 background_color=None, background_image=None, background_video=None,
                  pixelate_background=False, pixel_size=16,
                  invert_background=False,
                  foreground_effect=None, fps=30):
@@ -78,6 +78,7 @@ class CamolaGPU:
         self.input_name = self.session.get_inputs()[0].name
 
         # Prepare background
+        self.background_video_cap = None
         if background_color:
             # Parse hex color
             color_hex = background_color.lstrip('#')
@@ -92,6 +93,12 @@ class CamolaGPU:
                 raise RuntimeError(f"Failed to load background image: {background_image}")
             self.background = cv2.resize(bg, (output_width, output_height))
             print(f"Using image background: {background_image}")
+        elif background_video:
+            self.background_video_cap = cv2.VideoCapture(background_video)
+            if not self.background_video_cap.isOpened():
+                raise RuntimeError(f"Failed to load background video: {background_video}")
+            self.background = None  # Will be updated each frame
+            print(f"Using video background: {background_video}")
         else:
             self.background = None
             print("No background replacement")
@@ -156,6 +163,24 @@ class CamolaGPU:
             return cv2.cvtColor(sketch_gray, cv2.COLOR_GRAY2BGR)
         return frame
 
+    def get_background_frame(self):
+        """Get next frame from background video (with looping)"""
+        if self.background_video_cap is None:
+            return self.background
+
+        ret, bg_frame = self.background_video_cap.read()
+        if not ret:
+            # End of video, loop back to start
+            self.background_video_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            ret, bg_frame = self.background_video_cap.read()
+            if not ret:
+                # Fallback to None if still failing
+                return None
+
+        # Resize to output size
+        bg_frame = cv2.resize(bg_frame, (self.output_width, self.output_height))
+        return bg_frame
+
     def composite(self, frame, matte):
         """Composite foreground onto background using matte"""
         # Resize frame to output size
@@ -192,14 +217,17 @@ class CamolaGPU:
             composited = (foreground * matte_3ch + pixelated * (1 - matte_3ch)).astype(np.uint8)
             return composited
 
+        # Get background (static or video frame)
+        background = self.get_background_frame()
+
         # Background replacement
-        if self.background is None:
+        if background is None:
             # No background replacement, just return with foreground effect applied
             composited = (foreground * matte_3ch + frame_resized * (1 - matte_3ch)).astype(np.uint8)
             return composited
 
         # Composite: effected foreground + background
-        composited = (foreground * matte_3ch + self.background * (1 - matte_3ch)).astype(np.uint8)
+        composited = (foreground * matte_3ch + background * (1 - matte_3ch)).astype(np.uint8)
 
         return composited
 
@@ -283,6 +311,8 @@ class CamolaGPU:
             print("\nStopping...")
         finally:
             self.cap.release()
+            if self.background_video_cap is not None:
+                self.background_video_cap.release()
             self.output_device.close()
             print("Camola stopped")
 
@@ -298,6 +328,7 @@ def main():
     parser.add_argument("--fps", type=int, default=30, help="Target frames per second")
     parser.add_argument("--background-color", help="Solid color background in hex (e.g., 00FF00)")
     parser.add_argument("--background-image", help="Background image file path")
+    parser.add_argument("--background-video", help="Background video file path (loops automatically)")
     parser.add_argument("--pixelate-background", action="store_true", help="Pixelate background instead of replacing")
     parser.add_argument("--pixel-size", type=int, default=16, help="Pixel block size for pixelation effect (default: 16)")
     parser.add_argument("--invert-background", action="store_true", help="Invert colors in background")
@@ -315,6 +346,7 @@ def main():
         output_height=args.output_height,
         background_color=args.background_color,
         background_image=args.background_image,
+        background_video=args.background_video,
         pixelate_background=args.pixelate_background,
         pixel_size=args.pixel_size,
         invert_background=args.invert_background,
