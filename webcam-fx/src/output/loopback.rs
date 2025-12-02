@@ -1,13 +1,10 @@
 use super::OutputSink;
 use anyhow::{Context, Result};
-use image::{ImageBuffer, Rgb, RgbImage};
+use image::RgbImage;
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
-use v4l::buffer::Type;
-use v4l::io::traits::CaptureStream;
-use v4l::video::Capture;
-use v4l::{Device, FourCC};
+use v4l::{Device, FourCC, Format};
 
 pub struct V4L2Output {
     file: File,
@@ -25,14 +22,32 @@ impl V4L2Output {
             height
         );
 
-        // Open the device file directly for writing
-        // v4l2loopback accepts raw frame data written to the device file
+        // Open the v4l2 device for format configuration
+        let device = Device::with_path(path)
+            .with_context(|| format!("Failed to open v4l2loopback device at {}", path.display()))?;
+
+        // Set the output format to BGR0 (32-bit BGRA) at the requested resolution
+        let format = Format::new(width, height, FourCC::new(b"BGR4"));
+
+        // Configure the format using ioctl
+        let format = v4l::video::Output::set_format(&device, &format)
+            .context("Failed to set v4l2 device format")?;
+
+        tracing::info!(
+            "v4l2loopback device configured: {}x{}, fourcc: {}",
+            format.width,
+            format.height,
+            format.fourcc
+        );
+
+        // Drop the Device to close it
+        drop(device);
+
+        // Now open the device as a regular file for writing
         let file = File::options()
             .write(true)
             .open(path)
-            .with_context(|| format!("Failed to open v4l2loopback device at {}", path.display()))?;
-
-        tracing::info!("v4l2loopback device opened successfully");
+            .with_context(|| format!("Failed to open v4l2loopback device for writing at {}", path.display()))?;
 
         Ok(Self {
             file,
@@ -41,38 +56,20 @@ impl V4L2Output {
         })
     }
 
-    /// Convert RGB frame to YUV422 (YUYV) format
-    /// v4l2loopback typically expects YUYV format
-    fn rgb_to_yuyv(rgb_image: &RgbImage) -> Vec<u8> {
+    /// Convert RGB image to BGRA bytes (32-bit with alpha)
+    fn rgb_to_bgra(rgb_image: &RgbImage) -> Vec<u8> {
         let (width, height) = rgb_image.dimensions();
-        let mut yuyv = Vec::with_capacity((width * height * 2) as usize);
+        let mut bgra = Vec::with_capacity((width * height * 4) as usize);
 
-        for y in 0..height {
-            for x in (0..width).step_by(2) {
-                let pixel1 = rgb_image.get_pixel(x, y);
-                let pixel2 = if x + 1 < width {
-                    rgb_image.get_pixel(x + 1, y)
-                } else {
-                    pixel1
-                };
-
-                // Convert RGB to YUV
-                let (y1, u1, v1) = rgb_to_yuv(pixel1[0], pixel1[1], pixel1[2]);
-                let (y2, u2, v2) = rgb_to_yuv(pixel2[0], pixel2[1], pixel2[2]);
-
-                // Average U and V for the pair of pixels
-                let u = ((u1 as u16 + u2 as u16) / 2) as u8;
-                let v = ((v1 as u16 + v2 as u16) / 2) as u8;
-
-                // YUYV format: Y0 U Y1 V
-                yuyv.push(y1);
-                yuyv.push(u);
-                yuyv.push(y2);
-                yuyv.push(v);
-            }
+        for pixel in rgb_image.pixels() {
+            // BGRA format: Blue, Green, Red, Alpha
+            bgra.push(pixel[2]); // B
+            bgra.push(pixel[1]); // G
+            bgra.push(pixel[0]); // R
+            bgra.push(255);      // A (fully opaque)
         }
 
-        yuyv
+        bgra
     }
 }
 
@@ -103,12 +100,12 @@ impl OutputSink for V4L2Output {
             frame.clone()
         };
 
-        // Convert RGB to YUYV
-        let yuyv_data = Self::rgb_to_yuyv(&frame);
+        // Convert to BGRA (32-bit with alpha)
+        let bgra_data = Self::rgb_to_bgra(&frame);
 
         // Write directly to the device file
         self.file
-            .write_all(&yuyv_data)
+            .write_all(&bgra_data)
             .context("Failed to write frame to v4l2loopback device")?;
 
         Ok(())

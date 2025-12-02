@@ -2,8 +2,9 @@ use super::preprocess::Preprocessor;
 use super::types::{Matte, SegmentationModel};
 use anyhow::{Context, Result};
 use image::RgbImage;
-use ndarray::{Array4, IxDyn};
-use ort::{GraphOptimizationLevel, Session};
+use ndarray::Array4;
+use ort::session::builder::GraphOptimizationLevel;
+use ort::session::Session;
 use std::path::Path;
 
 /// RobustVideoMatting segmentation model
@@ -49,7 +50,7 @@ impl RobustVideoMatting {
             .with_context(|| format!("Failed to load model from {}", path.display()))?;
 
         tracing::info!("RVM model loaded successfully");
-        tracing::debug!("Available execution providers: {:?}", session.metadata()?.producer_name()?);
+        tracing::debug!("Model producer: {:?}", session.metadata()?.producer()?);
 
         // Default to 512x512 input (good balance of quality and performance)
         let width = 512;
@@ -105,15 +106,52 @@ impl SegmentationModel for RobustVideoMatting {
 
         // Run inference
         let _infer_span = tracing::debug_span!("inference").entered();
+
+        // Convert ndarray to ort Values - extract shape and data
+        let input_shape = input_tensor.dim();
+        let input_vec: Vec<f32> = input_tensor.iter().copied().collect();
+        let input_value = ort::value::Value::from_array((
+            [input_shape.0, input_shape.1, input_shape.2, input_shape.3].as_slice(),
+            input_vec
+        ))?;
+
+        let r1_shape = r1.dim();
+        let r1_vec: Vec<f32> = r1.iter().copied().collect();
+        let r1_value = ort::value::Value::from_array((
+            [r1_shape.0, r1_shape.1, r1_shape.2, r1_shape.3].as_slice(),
+            r1_vec
+        ))?;
+
+        let r2_shape = r2.dim();
+        let r2_vec: Vec<f32> = r2.iter().copied().collect();
+        let r2_value = ort::value::Value::from_array((
+            [r2_shape.0, r2_shape.1, r2_shape.2, r2_shape.3].as_slice(),
+            r2_vec
+        ))?;
+
+        let r3_shape = r3.dim();
+        let r3_vec: Vec<f32> = r3.iter().copied().collect();
+        let r3_value = ort::value::Value::from_array((
+            [r3_shape.0, r3_shape.1, r3_shape.2, r3_shape.3].as_slice(),
+            r3_vec
+        ))?;
+
+        let r4_shape = r4.dim();
+        let r4_vec: Vec<f32> = r4.iter().copied().collect();
+        let r4_value = ort::value::Value::from_array((
+            [r4_shape.0, r4_shape.1, r4_shape.2, r4_shape.3].as_slice(),
+            r4_vec
+        ))?;
+
         let outputs = self
             .session
             .run(ort::inputs![
-                input_tensor.view(),
-                r1.view(),
-                r2.view(),
-                r3.view(),
-                r4.view()
-            ]?)
+                input_value,
+                r1_value,
+                r2_value,
+                r3_value,
+                r4_value
+            ])
             .context("Failed to run inference")?;
         drop(_infer_span);
 
@@ -121,49 +159,43 @@ impl SegmentationModel for RobustVideoMatting {
         // We only need pha (the matte) and the updated hidden states
 
         // Alpha matte is typically the second output (index 1)
-        let pha = outputs[1]
-            .try_extract_tensor::<f32>()?
-            .view()
-            .to_owned()
-            .into_dimensionality::<IxDyn>()?;
+        let (pha_shape, pha_data) = outputs[1].try_extract_tensor::<f32>()?;
+        let matte_height = pha_shape[2] as usize;
+        let matte_width = pha_shape[3] as usize;
+        let matte_flat: Vec<f32> = pha_data.to_vec();
 
         // Update hidden states for next frame
+        let (r1_shape, r1_data) = outputs[2].try_extract_tensor::<f32>()?;
         self.r1 = Some(
-            outputs[2]
-                .try_extract_tensor::<f32>()?
-                .view()
-                .to_owned()
-                .into_dimensionality()?,
+            Array4::from_shape_vec(
+                (r1_shape[0] as usize, r1_shape[1] as usize, r1_shape[2] as usize, r1_shape[3] as usize),
+                r1_data.to_vec(),
+            )?,
         );
+
+        let (r2_shape, r2_data) = outputs[3].try_extract_tensor::<f32>()?;
         self.r2 = Some(
-            outputs[3]
-                .try_extract_tensor::<f32>()?
-                .view()
-                .to_owned()
-                .into_dimensionality()?,
+            Array4::from_shape_vec(
+                (r2_shape[0] as usize, r2_shape[1] as usize, r2_shape[2] as usize, r2_shape[3] as usize),
+                r2_data.to_vec(),
+            )?,
         );
+
+        let (r3_shape, r3_data) = outputs[4].try_extract_tensor::<f32>()?;
         self.r3 = Some(
-            outputs[4]
-                .try_extract_tensor::<f32>()?
-                .view()
-                .to_owned()
-                .into_dimensionality()?,
+            Array4::from_shape_vec(
+                (r3_shape[0] as usize, r3_shape[1] as usize, r3_shape[2] as usize, r3_shape[3] as usize),
+                r3_data.to_vec(),
+            )?,
         );
+
+        let (r4_shape, r4_data) = outputs[5].try_extract_tensor::<f32>()?;
         self.r4 = Some(
-            outputs[5]
-                .try_extract_tensor::<f32>()?
-                .view()
-                .to_owned()
-                .into_dimensionality()?,
+            Array4::from_shape_vec(
+                (r4_shape[0] as usize, r4_shape[1] as usize, r4_shape[2] as usize, r4_shape[3] as usize),
+                r4_data.to_vec(),
+            )?,
         );
-
-        // Extract matte values (shape: [1, 1, H, W])
-        let matte_shape = pha.shape();
-        let matte_height = matte_shape[2];
-        let matte_width = matte_shape[3];
-
-        // Flatten to Vec<f32>
-        let matte_flat: Vec<f32> = pha.iter().copied().collect();
 
         // Postprocess: resize back to original frame dimensions
         let (frame_width, frame_height) = frame.dimensions();

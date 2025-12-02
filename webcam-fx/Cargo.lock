@@ -280,6 +280,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b35204fbdc0b3f4446b89fc1ac2cf84a8a68971995d0bf2e925ec7cd960f9cb3"
 
 [[package]]
+name = "camola"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "image",
+ "ndarray 0.15.6",
+ "nokhwa",
+ "ort",
+ "thiserror 1.0.69",
+ "tracing",
+ "tracing-subscriber",
+ "v4l",
+]
+
+[[package]]
 name = "cc"
 version = "1.2.48"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2062,22 +2078,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cbc538057e648b67f72a982e708d485b2efa771e1ac05fec311f9f63e5800db4"
 dependencies = [
  "unicode-ident",
-]
-
-[[package]]
-name = "webcam-fx"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "image",
- "ndarray 0.15.6",
- "nokhwa",
- "ort",
- "thiserror 1.0.69",
- "tracing",
- "tracing-subscriber",
- "v4l",
 ]
 
 [[package]]
